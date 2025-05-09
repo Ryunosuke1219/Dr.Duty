@@ -12,124 +12,137 @@ def shift_sort_key(col):
 
 from ortools.sat.python import cp_model
 
-def build_schedule(df_raw: pd.DataFrame, year: int, month: int,
-                   oncall_weight: float = 0.3):
+def build_schedule(df_raw: pd.DataFrame, year: int, month: int):
     """
-    CP-SAT で Duty / on-call を同時最適化。
-    回数バランス (max−min) を最小化 → 次に希望充足数を最大化。
+    シンプルな greedy 版：
+      • G1 Duty = 2 固定
+      • G0 Duty 1–2 回、on-call 上限 2 回
+      • 連続勤務 3 日空け / 週 1 回 / 休日-1 Duty 月 1 回 を守る
     """
     doctors   = df_raw['Name'].tolist()
-    group_map = df_raw.set_index('Name')['Group'].to_dict()
-    avail     = 1 - df_raw.drop(columns=['Group', 'Name'])    # 1 = 勤務可
-    shifts    = sorted(avail.columns, key=lambda c: (
-        int(re.match(r'(\d+)', c).group(1)),
-        int(re.search(r'-(\d)', c).group(1)) if '-' in c else 0))
-    day_of    = {c: int(re.match(r'(\d+)', c).group(1)) for c in shifts}
-    sub_of    = {c: int(re.search(r'-(\d)', c).group(1)) if '-' in c else 0 for c in shifts}
+    group     = df_raw.set_index('Name')['Group'].to_dict()
+    avail     = 1 - df_raw.drop(columns=['Group', 'Name'])
 
-    # --- CP-SAT モデル ---
-    m = cp_model.CpModel()
-    x = {}       # Duty vars
-    y = {}       # on-call vars
+    # --- シフト列を日付順 ----------
+    shifts = sorted(
+        avail.columns,
+        key=lambda c: (int(re.match(r'(\d+)', c).group(1)),
+                       int(re.search(r'-(\d)', c).group(1)) if '-' in c else 0)
+    )
+    day_of  = {c: int(re.match(r'(\d+)', c).group(1)) for c in shifts}
+    sub_of  = {c: int(re.search(r'-(\d)', c).group(1)) if '-' in c else 0 for c in shifts}
 
-    for d in doctors:
-        for s in shifts:
-            x[d, s] = m.NewBoolVar(f"x_{d}_{s}")
-            y[d, s] = m.NewBoolVar(f"y_{d}_{s}")
+    # --- 各種カウンタ ---------------
+    duty   = defaultdict(dict)
+    oncall = {}
+    duty_cnt   = defaultdict(int)
+    oncall_cnt = defaultdict(int)
+    last_work  = {d: -10 for d in doctors}
+    weekly_cnt = defaultdict(lambda: defaultdict(int))
+    holiday1_cnt = defaultdict(int)
 
-            # 勤務可日にしか立てない
-            if avail.loc[df_raw['Name'] == d, s].iat[0] == 0:
-                m.Add(x[d, s] == 0)
-                m.Add(y[d, s] == 0)
-
-    # --- シフト充足制約 ---
-    for s in shifts:
-        # Duty
-        if sub_of[s] == 1:                             # -1 … G0 + G1
-            m.Add(sum(x[d, s] for d in doctors if group_map[d] == 0) == 1)
-            m.Add(sum(x[d, s] for d in doctors if group_map[d] == 1) == 1)
-            m.Add(sum(y[d, s] for d in doctors) == 0)  # on-call なし
-        else:                                          # single 1 名
-            m.Add(sum(x[d, s] for d in doctors) == 1)
-            # on-call = Duty が G1 のときだけ G0 1 名
-            m.Add(
-                sum(y[d, s] for d in doctors if group_map[d] == 0)
-                == sum(x[d, s] for d in doctors if group_map[d] == 1)
-            )
-            m.Add(
-                sum(y[d, s] for d in doctors if group_map[d] == 1) == 0
-            )
-
-    # --- 3 日間隔＆週 1 回＆ -1 月 1 回 制約 ---
     SPACE = 3
     week_idx = lambda day: (day - 1) // 7
-    for d in doctors:
-        for i, s1 in enumerate(shifts):
-            day1 = day_of[s1]
-            # 3 日間隔
-            for s2 in shifts[i + 1:]:
-                if 1 <= day_of[s2] - day1 < SPACE:
-                    m.Add(x[d, s1] + y[d, s1] + x[d, s2] + y[d, s2] <= 1)
 
-        # 週 1 回 Duty 制限
-        for w in range(5):
-            m.Add(
-                sum(x[d, s] for s in shifts if week_idx(day_of[s]) == w) <= 1
+    def can_work(d, col):
+        day = day_of[col]
+        return (
+            avail.loc[df_raw['Name'] == d, col].iat[0] == 1 and
+            day - last_work[d] >= SPACE and
+            weekly_cnt[d][week_idx(day)] == 0 and
+            (holiday1_cnt[d] < 1 if sub_of[col] == 1 else True)
+        )
+
+    # --- ① Group1 Duty = 2 固定 ----------
+    g1 = [d for d in doctors if group[d] == 1]
+    hd = [c for c in shifts if sub_of[c] == 1]   # -1
+    sg = [c for c in shifts if sub_of[c] != 1]   # single
+
+    random.shuffle(g1)
+    for doc in g1:
+        # 休日-1 から 1 回
+        for col in hd:
+            if can_work(doc, col) and 'G1' not in duty[col].values():
+                duty[col][doc] = 'G1'
+                duty_cnt[doc] = 1
+                last_work[doc] = day_of[col]
+                weekly_cnt[doc][week_idx(day_of[col])] = 1
+                holiday1_cnt[doc] = 1
+                break
+        # 平日 / -2 から 1 回
+        for col in sg:
+            if duty_cnt[doc] == 2:
+                break
+            if can_work(doc, col) and 'G1' not in duty[col].values():
+                duty[col][doc] = 'G1'
+                duty_cnt[doc] = 2
+                last_work[doc] = day_of[col]
+                weekly_cnt[doc][week_idx(day_of[col])] = 1
+                break
+
+    # --- ② Group0 Duty 1–2 回 ----------
+    g0 = [d for d in doctors if group[d] == 0]
+    random.shuffle(g0)
+
+    # 1 回目を確保
+    for doc in g0:
+        for col in shifts:
+            need = (
+                (sub_of[col] == 1 and 'G0' not in duty[col].values()) or
+                (sub_of[col] != 1 and not duty[col])
             )
+            if need and can_work(doc, col):
+                duty[col][doc] = 'G0'
+                duty_cnt[doc] += 1
+                last_work[doc] = day_of[col]
+                weekly_cnt[doc][week_idx(day_of[col])] = 1
+                if sub_of[col] == 1:
+                    holiday1_cnt[doc] += 1
+                break
 
-        # -1 列は月 1 回
-        m.Add(
-            sum(x[d, s] for s in shifts if sub_of[s] == 1) <= 1
-        )
+    # 2 回目（空き枠がある列）  
+    for col in shifts:
+        if (sub_of[col] == 1 and 'G0' not in duty[col].values()) or \
+           (sub_of[col] != 1 and not duty[col]):
+            cands = [d for d in g0 if duty_cnt[d] < 2 and can_work(d, col)]
+            if cands:
+                doc = random.choice(cands)
+                duty[col][doc] = 'G0'
+                duty_cnt[doc] += 1
+                last_work[doc] = day_of[col]
+                weekly_cnt[doc][week_idx(day_of[col])] = 1
+                if sub_of[col] == 1:
+                    holiday1_cnt[doc] += 1
 
-    # --- 回数バランス用の最大・最小変数 ---
-    total = {}
-    for d in doctors:
-        total[d] = m.NewIntVar(0, 20, f"total_{d}")
-        m.Add(
-            total[d] == sum(x[d, s] + int(oncall_weight * 10) * y[d, s]
-                            for s in shifts)
-        )
+    # --- ③ on-call (G0) : 上限 2 回 ----------
+    for col in sg:
+        if 'G1' in duty[col].values():
+            cands = [
+                d for d in g0
+                if d not in duty[col] and oncall_cnt[d] < 2 and can_work(d, col)
+            ]
+            if cands:
+                doc = random.choice(cands)
+                oncall[col] = doc
+                oncall_cnt[doc] += 1
+                last_work[doc] = day_of[col]
 
-    max_total = m.NewIntVar(0, 20, "max_total")
-    min_total = m.NewIntVar(0, 20, "min_total")
-    m.AddMaxEquality(max_total, [total[d] for d in doctors])
-    m.AddMinEquality(min_total, [total[d] for d in doctors])
-
-    # --- 目的 1: max_total − min_total を最小化 ---
-    balance_span = m.NewIntVar(0, 20, "span")
-    m.Add(balance_span == max_total - min_total)
-    m.Minimize(balance_span)
-
-    # --- 目的 2: 希望充足数（可／不可 0→1 のみ）を最大化 ---
-    #    CP-SAT は一次目的が満たされた後、二次目的を最大化してくれる
-    m.Maximize(sum(x[d, s] + y[d, s] for d in doctors for s in shifts))
-
-    # --- Solve ---
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 15
-    solver.parameters.num_search_workers = 8
-    if solver.Solve(m) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        st.error("最適解が得られませんでした…")
-        st.stop()
-
-    # --- 結果 DataFrame ---
+    # --- DataFrame 出力 ----------
     rows = []
-    for s in shifts:
+    for c in shifts:
         rows.append({
-            "Shift": s,
-            "Duty_G0": ", ".join(d for d in doctors if solver.Value(x[d, s]) and group_map[d] == 0),
-            "Duty_G1": ", ".join(d for d in doctors if solver.Value(x[d, s]) and group_map[d] == 1),
-            "Oncall_G0": ", ".join(d for d in doctors if solver.Value(y[d, s]))
+            'Shift': c,
+            'Duty_G0': ', '.join([d for d, g in duty[c].items() if g == 'G0']),
+            'Duty_G1': ', '.join([d for d, g in duty[c].items() if g == 'G1']),
+            'Oncall_G0': oncall.get(c, '')
         })
     schedule_df = pd.DataFrame(rows)
 
     summary_df = pd.DataFrame({
-        "Group":   [group_map[d] for d in doctors],
-        "Duty":    [sum(solver.Value(x[d, s]) for s in shifts) for d in doctors],
-        "Oncall":  [sum(solver.Value(y[d, s]) for s in shifts) for d in doctors],
+        'Group':  [group[d] for d in doctors],
+        'Duty':   [duty_cnt[d] for d in doctors],
+        'Oncall': [oncall_cnt[d] for d in doctors]
     }, index=doctors)
-    summary_df["Total"] = summary_df["Duty"] + oncall_weight * summary_df["Oncall"]
 
     return schedule_df, summary_df
 
