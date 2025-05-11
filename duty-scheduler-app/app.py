@@ -1,4 +1,6 @@
-import streamlit as st, pandas as pd, re, random, datetime, tempfile, os, io, csv
+import pandas as pd
+import streamlit as st            # ← 1 行でエイリアス指定
+import re, random, datetime, tempfile, os, io, csv
 from collections import defaultdict
 from ortools.sat.python import cp_model
 from utils.generate_calendar import generate_pretty_calendar
