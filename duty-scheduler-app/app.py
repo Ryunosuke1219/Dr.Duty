@@ -2,6 +2,7 @@ import streamlit as st, pandas as pd, re, random, datetime, tempfile, os, io, cs
 from collections import defaultdict
 from ortools.sat.python import cp_model
 from utils.generate_calendar import generate_pretty_calendar
+from utils.loose_scheduler import build_schedule as build_schedule_loose
 
 # ---------- スケジューラ（3 日間隔 + 5 ルール） ----------
 def build_schedule(df_raw: pd.DataFrame, year: int, month: int):
@@ -103,7 +104,14 @@ with col2:
 
 if csv_file:
     df_raw = pd.read_csv(csv_file, encoding="cp932")
-    sched, summary = build_schedule(df_raw, int(year), int(month))
+
+    mode = st.radio("割付モードを選択", ["strict", "loose"], horizontal=True)
+
+    if mode == "strict":
+        sched, summary = build_schedule(df_raw, int(year), int(month))
+    else:  # loose
+        sched, summary = build_schedule_loose(df_raw, int(year), int(month))
+    # ▲▲ ここまで ▲▲
 
     # ---------- 表示 ----------
     st.subheader("Schedule")
